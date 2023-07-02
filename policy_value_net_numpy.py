@@ -112,4 +112,5 @@ class PolicyValueNetNumpy():
         X_v = relu(fc_forward(X_v.flatten(), self.params[12], self.params[13]))
         value = np.tanh(fc_forward(X_v, self.params[14], self.params[15]))[0]
         act_probs = zip(legal_positions, act_probs.flatten()[legal_positions])
+        # act_probs = list(act_probs)
         return act_probs, value

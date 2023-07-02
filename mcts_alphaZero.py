@@ -8,7 +8,9 @@ network to guide the tree search and evaluate the leaf nodes
 
 import numpy as np
 import copy
-
+import concurrent.futures
+import time
+import multiprocessing
 
 def softmax(x):
     probs = np.exp(x - np.max(x))
@@ -61,7 +63,7 @@ class TreeNode(object):
         self._Q += 1.0*(leaf_value - self._Q) / self._n_visits
 
     def increment_virtual_loss(self):
-        self._virtual_loss += 1;
+        self._virtual_loss += 1
 
     def update_recursive(self, leaf_value):
         """Like a call to update(), but applied recursively for all ancestors.
@@ -145,6 +147,111 @@ class MCTS(object):
 
         # Update value and visit count of nodes in this traversal.
         node.update_recursive(-leaf_value)
+    
+    def get_nn_result(self, state):
+        return self._policy(state)
+
+    def simulate(self, state, temp=1e-3):
+        completed = tasks_running = available = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [0 for _ in range(4)]
+            while (completed < self._n_playout):
+                node = self._root
+                state_copy = copy.deepcopy(state)
+                while (True):
+                    if node.is_leaf():
+                        break
+                    # Greedily select next move.
+                    action, node = node.select(self._c_puct)
+                    node.increment_virtual_loss()
+                    state_copy.do_move(action)
+                end, winner = state_copy.game_end()
+                if (end):
+                    leaf_value = 0.0 if winner == -1 else (1.0 if winner == state_copy.get_current_player() else -1.0)
+                    node.update_recursive(-leaf_value)
+                    completed += 1
+                    continue
+                else:
+                    future = executor.submit(self.get_nn_result, state_copy)
+                    futures[available] = future
+                    tasks_running += 1
+                    available += 1
+                    if (tasks_running >= 4):
+                        while (True):
+                            i = 0
+                            while (i < 4):
+                                if (futures[i].done()):
+                                    action_probs, leaf_value = future.result()
+                                    node.expand(action_probs)
+                                    node.update_recursive(-leaf_value)
+                                    completed += 1
+                                    tasks_running -= 1
+                                    available = i
+                                    break
+                                i += 1
+                            if (i < 4):
+                                break
+                            
+        
+        # calc the move probabilities based on visit counts at the root node
+        act_visits = [(act, node._n_visits)
+                      for act, node in self._root._children.items()]
+        acts, visits = zip(*act_visits)
+        act_probs = softmax(1.0/temp * np.log(np.array(visits) + 1e-10))
+
+        return acts, act_probs
+
+    def get_nn_result_2(self, queue, state):
+        queue.put(self._policy(state))
+
+    def simulate_2(self, state, temp=1e-3):
+        completed = tasks_running = available = 0
+        processes = []
+        queue = multiprocessing.Queue()
+        while (completed < self._n_playout):
+            node = self._root
+            state_copy = copy.deepcopy(state)
+            while (True):
+                if node.is_leaf():
+                    break
+                # Greedily select next move.
+                action, node = node.select(self._c_puct)
+                node.increment_virtual_loss()
+                state_copy.do_move(action)
+            end, winner = state_copy.game_end()
+            if (end):
+                leaf_value = 0.0 if winner == -1 else (1.0 if winner == state_copy.get_current_player() else -1.0)
+                node.update_recursive(leaf_value)
+                completed += 1
+                continue
+            else:
+                if (len(processes) < 32):
+                    process = multiprocessing.Process(target=self.get_nn_result_2, args=(queue, state_copy))
+                    processes.append(process)
+                    process.start()
+                else:
+                    while (True):
+                        if (not queue.empty()):
+                            action_probs, leaf_value = queue.get()
+                            node.expand(action_probs)
+                            node.update_recursive(-leaf_value)
+                            completed += 1
+                            
+                            for process in processes:
+                                if (not process.is_alive()):
+                                    process.join()
+                                    processes.remove(process)
+                            break
+        for process in processes:
+            process.join()
+        
+        # calc the move probabilities based on visit counts at the root node
+        act_visits = [(act, node._n_visits)
+                      for act, node in self._root._children.items()]
+        acts, visits = zip(*act_visits)
+        act_probs = softmax(1.0/temp * np.log(np.array(visits) + 1e-10))
+
+        return acts, act_probs
 
     def get_move_probs(self, state, temp=1e-3):
         """Run all playouts sequentially and return the available actions and
@@ -197,7 +304,9 @@ class MCTSPlayer(object):
         # the pi vector returned by MCTS as in the alphaGo Zero paper
         move_probs = np.zeros(board.width*board.height)
         if len(sensible_moves) > 0:
-            acts, probs = self.mcts.get_move_probs(board, temp)
+            start = time.time()
+            acts, probs = self.mcts.simulate(board, temp)
+            print(time.time() - start)
             move_probs[list(acts)] = probs
             if self._is_selfplay:
                 # add Dirichlet Noise for exploration (needed for
